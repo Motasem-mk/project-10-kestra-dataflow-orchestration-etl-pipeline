@@ -145,13 +145,18 @@ docker compose up -d
 
 ```
 bottleneck/
-├── docker-compose.yml
+├── flows/
+│   └── bottleneck_monthly_etl.yaml
+├── data/
+│   ├── erp.xlsx
+│   ├── web.xlsx
+│   └── liaison.xlsx
 ├── Dockerfile
 ├── application.yml
-├── erp.xlsx
-├── web.xlsx
-├── liaison.xlsx
-└── README.md
+├── docker-compose.yml
+├── README.md
+└── .gitignore
+
 ```
 
 ---
