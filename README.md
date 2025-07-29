@@ -96,6 +96,11 @@ graph TD
 
 ---
 
+> 🔐 AWS and SendGrid credentials are securely passed as base64-encoded environment variables in `docker-compose.yml`. Kestra decodes them automatically using the `secrets:` namespace.
+
+
+---
+
 ##  Output Artifacts
 
 | File Name                     | Description                           |
