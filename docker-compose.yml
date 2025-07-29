@@ -1,0 +1,124 @@
+version: '3.9'
+
+volumes:
+  postgres-data:
+    driver: local
+  kestra-data:
+    driver: local
+
+services:
+  # Postgres metadata & queue
+  postgres:
+    image: postgres
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: kestra
+      POSTGRES_USER: kestra
+      POSTGRES_PASSWORD: k3str4
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Kestra server + worker
+  kestra:
+    image: kestra/kestra:latest
+    user: "root"
+    command: server standalone
+    volumes:
+      - kestra-data:/app/storage
+      - ./application.yml:/app/config/application.yml
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/kestra-wd:/tmp/kestra-wd
+    environment:
+      MICRONAUT_CONFIG_FILES: /app/config/application.yml
+
+      # Base64-encoded secrets
+      SECRET_AWS_ACCESS_KEY_ID: "QUtJQTJZSUNBT0JYRVoyWExJTkk="
+      SECRET_AWS_SECRET_ACCESS_KEY: "a0VsY3p2aGx4OEJHQlVMUGlFTk5hbU10ZzlXby9oWitnYXJlY1hPaA=="
+      SECRET_AWS_REGION: "ZXUtd2VzdC0z"
+      SECRET_SENDGRID_API_KEY: "U0cuSklrNjVGYkJUWXVBckY1VjF4dDdQUS5hel90bHVZYW1qMUlkcF9uWTZacVdWUmdmQkZGZjRPaUVnc3ZsajFhVUYw"
+
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Build helper image once, so tasks can reference it by name
+  python-helper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kestra-python-deps:latest
+
+
+
+#    version: '3.9'
+
+# volumes:
+#   postgres-data:
+#   kestra-data:
+#   workspace-data:
+#   config-data:
+#   local-data:
+
+# services:
+#   postgres:
+#     image: postgres:15
+#     container_name: postgres
+#     volumes:
+#       - postgres-data:/var/lib/postgresql/data
+#     environment:
+#       POSTGRES_DB: kestra
+#       POSTGRES_USER: kestra
+#       POSTGRES_PASSWORD: k3str4
+#     healthcheck:
+#       test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+#       interval: 5s
+#       timeout: 5s
+#       retries: 20
+
+#   kestra:
+#     image: kestra/kestra:latest
+#     container_name: kestra
+#     user: "root"
+#     command: server standalone
+#     environment:
+#       # Base64-encoded secrets
+#       SECRETS__AWS_ACCESS_KEY_ID: "QUtJQTJZSUNBT0JYRVoyWExJTkk="
+#       SECRETS__AWS_SECRET_ACCESS_KEY: "a0VsY3p2aGx4OEJHQlVMUGlFTk5hbU10ZzlXby9oWitnYXJlY1hPaA=="
+#       SECRETS__AWS_REGION: "ZXUtd2VzdC0z"
+#       SECRETS__SENDGRID_API_KEY: "U0cuSklrNjVGYkJUWXVBckY1VjF4dDdQUS5hel90bHVZYW1qMUlkcF9uWTZacVdWUmdmQkZGZjRPaUVnc3ZsajFhVUYw"
+#       SECRETS__BASIC_AUTH_USERNAME: "YWRtaW4="     # "admin"
+#       SECRETS__BASIC_AUTH_PASSWORD: "c3VwZXJzZWNyZXQ="  # "supersecret"
+#     volumes:
+#       - kestra-data:/app/storage
+#       - ./application.yml:/app/config/application.yml
+#       - /var/run/docker.sock:/var/run/docker.sock
+#       - workspace-data:/workspace
+#       - config-data:/config
+#       - local-data:/local
+#       - /tmp/kestra-wd:/tmp/kestra-wd
+#     ports:
+#       - "8080:8080"
+#       - "8081:8081"
+#     depends_on:
+#       postgres:
+#         condition: service_healthy
+
+#   python-helper:
+#     build:
+#       context: .
+#       dockerfile: Dockerfile
+#     image: kestra-python-deps:latest
+#     container_name: python-helper
+#     environment:
+#       PYTHON_VERSION: "3.11"
+#       WORKSPACE_ROOT: "/workspace"
+#     volumes:
+#       - workspace-data:/workspace
+#       - /var/run/docker.sock:/var/run/docker.sock
