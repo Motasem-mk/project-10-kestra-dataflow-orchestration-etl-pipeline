@@ -1,7 +1,7 @@
 id: p10_kestra_dataflow_orchestration_pipeline
 namespace: com.bottleneck
 description: >
-  Automated ETL for BottleNeck monthly revenue & premium‑wine reporting using DuckDB and S3.
+  Automated ETL (Kestra) for BottleNeck monthly revenue & premium‑wine reporting using DuckDB and S3.
 
 triggers:
   - id: schedule
