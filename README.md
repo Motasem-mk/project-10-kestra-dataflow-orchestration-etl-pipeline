@@ -36,7 +36,7 @@ bottleneck/
 
 ---
 
-## 🧠 Problem Statement
+## Problem Statement
 
 The current manual processing of sales data is time-consuming and error-prone. Key issues include:
 
