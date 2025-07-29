@@ -16,6 +16,26 @@ BottleNeck collects monthly sales, ERP, and mapping data from various systems in
 
 ---
 
+##  Project Structure
+
+```
+bottleneck/
+├── flows/
+│   └── bottleneck_monthly_etl.yaml
+├── data/
+│   ├── erp.xlsx
+│   ├── web.xlsx
+│   └── liaison.xlsx
+├── Dockerfile
+├── application.yml
+├── docker-compose.yml
+├── README.md
+└── .gitignore
+
+```
+
+---
+
 ## 🧠 Problem Statement
 
 The current manual processing of sales data is time-consuming and error-prone. Key issues include:
@@ -137,26 +157,6 @@ docker compose up -d
 
 **Motasem Abualqumboz**  
 📧 motasemmkamz@gmail.com
-
----
-
-##  Project Structure
-
-```
-bottleneck/
-├── flows/
-│   └── bottleneck_monthly_etl.yaml
-├── data/
-│   ├── erp.xlsx
-│   ├── web.xlsx
-│   └── liaison.xlsx
-├── Dockerfile
-├── application.yml
-├── docker-compose.yml
-├── README.md
-└── .gitignore
-
-```
 
 ---
 
