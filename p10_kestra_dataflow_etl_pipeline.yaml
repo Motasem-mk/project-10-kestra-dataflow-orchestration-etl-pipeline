@@ -1,0 +1,331 @@
+id: p10_kestra_dataflow_orchestration_pipeline
+namespace: com.bottleneck
+description: >
+  Automated ETL for BottleNeck monthly revenue & premium‑wine reporting using DuckDB and S3.
+
+triggers:
+  - id: schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 9 15 * *"
+    timezone: Europe/Paris
+
+tasks:
+  # 1. Combined load of ERP, Web & Liaison from S3 → CSV
+  - id: load_all_sources
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: kestra-python-deps:latest
+    env:
+     AWS_ACCESS_KEY_ID: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+     AWS_SECRET_ACCESS_KEY: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+     AWS_REGION: "{{ secret('AWS_REGION') }}"
+    outputFiles:
+      - erp.csv
+      - web.csv
+      - liaison.csv
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    script: |
+      import  boto3, pandas as pd, os
+
+      s3 = boto3.client("s3", region_name=os.environ["AWS_REGION"])
+      bucket = "my-kestra-bucket"
+      files = {
+        "bottleneck/erp.xlsx":     "erp.xlsx",
+        "bottleneck/web.xlsx":     "web.xlsx",
+        "bottleneck/liaison.xlsx": "liaison.xlsx"
+      }
+
+      for key, local in files.items():
+        s3.download_file(bucket, key, local)
+        df = pd.read_excel(local)
+        out_csv = local.replace(".xlsx", ".csv")
+        df.to_csv(out_csv, index=False)
+
+  # 2. Clean & dedupe ERP
+  - id: erp_clean_dedupe
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    inputFiles:
+      erp.csv: "{{ outputs.load_all_sources.outputFiles['erp.csv'] }}"
+    url: "jdbc:duckdb:/tmp/bottleneck.db"
+    sql: |
+      CREATE OR REPLACE TABLE erp_clean AS
+        SELECT * FROM read_csv_auto('erp.csv') WHERE product_id IS NOT NULL;
+      CREATE OR REPLACE TABLE erp_deduped AS
+        SELECT DISTINCT * FROM erp_clean;
+
+  # 3. Test ERP row count
+  - id: erp_test
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    url: "jdbc:duckdb:/tmp/bottleneck.db"
+    sql: |
+      SELECT CASE WHEN (SELECT COUNT(*) FROM erp_deduped) = 825 THEN 1 ELSE 1/0 END;
+
+  # 4. Clean & dedupe Web
+  - id: web_clean_dedupe
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    inputFiles:
+      web.csv: "{{ outputs.load_all_sources.outputFiles['web.csv'] }}"
+    url: "jdbc:duckdb:/tmp/bottleneck.db"
+    sql: |
+      CREATE OR REPLACE TABLE web_clean AS
+        SELECT * FROM read_csv_auto('web.csv') WHERE sku IS NOT NULL;
+      CREATE OR REPLACE TABLE web_sorted AS
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY sku ORDER BY total_sales DESC) AS rn
+        FROM web_clean;
+      CREATE OR REPLACE TABLE web_deduped AS
+        SELECT * EXCLUDE(rn) FROM web_sorted WHERE rn = 1;
+
+  # 5. Test Web row count
+  - id: web_test
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    url: "jdbc:duckdb:/tmp/bottleneck.db"
+    sql: |
+      SELECT CASE WHEN (SELECT COUNT(*) FROM web_deduped) = 714 THEN 1 ELSE 1/0 END;
+
+  # 6. Clean & dedupe Liaison
+  - id: liaison_clean_dedupe
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    inputFiles:
+      liaison.csv: "{{ outputs.load_all_sources.outputFiles['liaison.csv'] }}"
+    url: "jdbc:duckdb:/tmp/bottleneck.db"
+    sql: |
+      CREATE OR REPLACE TABLE liaison_clean AS
+        SELECT * FROM read_csv_auto('liaison.csv');
+      CREATE OR REPLACE TABLE liaison_deduped AS
+        SELECT DISTINCT * FROM liaison_clean;
+
+  # 7. Test Liaison row count
+  - id: liaison_test
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    url: "jdbc:duckdb:/tmp/bottleneck.db"
+    sql: |
+      SELECT CASE WHEN (SELECT COUNT(*) FROM liaison_deduped) = 825 THEN 1 ELSE 1/0 END;
+
+  # 8. Merge tables (all columns)
+  - id: merge_only
+    runIf: >
+      {{ outputs.erp_clean_dedupe is defined }}
+      and {{ outputs.web_clean_dedupe is defined }}
+      and {{ outputs.liaison_clean_dedupe is defined }}
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    url: "jdbc:duckdb:/tmp/bottleneck.db"
+    outputFiles:
+      - merged.csv
+    sql: |
+      CREATE OR REPLACE TABLE merged AS
+        SELECT
+          erp.*,
+          l.*,
+          web.*
+        FROM erp_deduped   AS erp
+        JOIN liaison_deduped AS l
+          ON erp.product_id = l.product_id
+        JOIN web_deduped   AS web
+          ON l.id_web = web.sku;
+      SELECT CASE WHEN (SELECT COUNT(*) FROM merged) > 0 THEN 1 ELSE 1/0 END;
+      COPY merged TO '{{ outputFiles["merged.csv"] }}' (HEADER);
+
+  # 9. Compute per‑row revenue
+  - id: compute_revenue
+    runIf: "{{ outputs.merge_only.outputFiles['merged.csv'] is defined }}"
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    inputFiles:
+      merged.csv: "{{ outputs.merge_only.outputFiles['merged.csv'] }}"
+    outputFiles:
+      - merged_with_revenue.csv
+    sql: |
+      CREATE OR REPLACE TABLE merged_rev AS
+        SELECT *, price * total_sales AS revenue
+        FROM read_csv_auto('merged.csv');
+      SELECT CASE WHEN (SELECT COUNT(*) FROM merged_rev WHERE revenue IS NULL) = 0 THEN 1 ELSE 1/0 END;
+      COPY merged_rev TO '{{ outputFiles["merged_with_revenue.csv"] }}' (HEADER);
+
+  # 10. Aggregate revenue by product + extra columns
+  - id: revenue_aggregate
+    runIf: "{{ outputs.compute_revenue.outputFiles['merged_with_revenue.csv'] is defined }}"
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    inputFiles:
+      merged_with_revenue.csv: "{{ outputs.compute_revenue.outputFiles['merged_with_revenue.csv'] }}"
+    url: "jdbc:duckdb:/tmp/bottleneck.db"
+    outputFiles:
+      - revenue_per_product.csv
+    sql: |
+      CREATE OR REPLACE TABLE revenue_per_product AS
+        SELECT
+          product_id,
+          sku,
+          post_title,
+          SUM(total_sales) AS total_sales,
+          SUM(revenue)     AS revenue
+        FROM read_csv_auto('merged_with_revenue.csv')
+        GROUP BY
+          product_id,
+          sku,
+          post_title
+          ORDER BY revenue DESC;
+      SELECT CASE WHEN (SELECT COUNT(*) FROM revenue_per_product WHERE revenue IS NULL)=0 THEN 1 ELSE 1/0 END;
+      SELECT CASE WHEN ABS((SELECT SUM(revenue) FROM revenue_per_product) - 70568.60) < 0.01 THEN 1 ELSE 1/0 END;
+      COPY revenue_per_product TO '{{ outputFiles["revenue_per_product.csv"] }}' (HEADER);
+
+  # 11. Z‑score flagging
+  - id: zscore_flagging
+    runIf: "{{ outputs.compute_revenue.outputFiles['merged_with_revenue.csv'] is defined }}"
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: kestra-python-deps:latest
+    inputFiles:
+      merged_with_revenue.csv: "{{ outputs.compute_revenue.outputFiles['merged_with_revenue.csv'] }}"
+    outputFiles:
+      - premium_flagged.csv
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    script: |
+      import  pandas as pd
+
+      df = pd.read_csv('merged_with_revenue.csv')
+      mu, sigma = df['price'].mean(), df['price'].std()
+      df['z_score'] = (df['price'] - mu) / sigma
+      df['is_vintage'] = df['z_score'] > 2
+
+      count = int(df['is_vintage'].sum())
+      assert count == 30, f"Expected 30 vintage wines, got {count}"
+
+      df.to_csv('premium_flagged.csv', index=False)
+
+  # 12. Export enriched Excel report with per‑product details + total
+  - id: export_revenue_xlsx
+    runIf: "{{ outputs.revenue_aggregate.outputFiles['revenue_per_product.csv'] is defined }}"
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: kestra-python-deps:latest
+    inputFiles:
+      revenue_per_product.csv: "{{ outputs.revenue_aggregate.outputFiles['revenue_per_product.csv'] }}"
+    outputFiles:
+      - revenue_per_product.xlsx
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    script: |
+      import  pandas as pd
+
+      df = pd.read_csv('revenue_per_product.csv')
+      total = df['revenue'].sum()
+
+      with pd.ExcelWriter('revenue_per_product.xlsx', engine='openpyxl') as writer:
+          df.to_excel(
+            writer,
+            index=False,
+            sheet_name='Revenue by Product'
+          )
+          summary = pd.DataFrame({
+            'Metric': ['Total Revenue'],
+            'Value':  [total]
+          })
+          summary.to_excel(
+            writer,
+            index=False,
+            sheet_name='Summary'
+          )
+
+  # 13. Extract premium wines
+  - id: extract_premium
+    runIf: "{{ outputs.zscore_flagging.outputFiles['premium_flagged.csv'] is defined }}"
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    inputFiles:
+      premium_flagged.csv: "{{ outputs.zscore_flagging.outputFiles['premium_flagged.csv'] }}"
+    url: "jdbc:duckdb:/tmp/bottleneck.db"
+    outputFiles:
+      - premium_wines.csv
+    sql: |
+      CREATE OR REPLACE TABLE premium AS
+        SELECT product_id, sku, post_title, price, total_sales, revenue, stock_status, z_score, is_vintage, guid
+        FROM read_csv_auto('premium_flagged.csv') WHERE is_vintage = TRUE ORDER BY price DESC;
+      COPY premium TO '{{ outputFiles["premium_wines.csv"] }}' (HEADER);
+
+  # 14. Extract ordinary wines
+  - id: extract_ordinary
+    runIf: "{{ outputs.zscore_flagging.outputFiles['premium_flagged.csv'] is defined }}"
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    inputFiles:
+      premium_flagged.csv: "{{ outputs.zscore_flagging.outputFiles['premium_flagged.csv'] }}"
+    url: "jdbc:duckdb:/tmp/bottleneck.db"
+    outputFiles:
+      - ordinary_wines.csv
+    sql: |
+      CREATE OR REPLACE TABLE ordinary AS
+        SELECT product_id, sku, post_title, price, total_sales, revenue, stock_status, z_score, is_vintage, guid
+        FROM read_csv_auto('premium_flagged.csv')
+        WHERE is_vintage = FALSE
+        ORDER BY price DESC;
+      COPY ordinary TO '{{ outputFiles["ordinary_wines.csv"] }}' (HEADER);
+
+  # 15. Upload extracts to S3
+  - id: upload_all_extracts
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: kestra-python-deps:latest
+    env:
+     AWS_ACCESS_KEY_ID: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+     AWS_SECRET_ACCESS_KEY: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+     AWS_REGION: "{{ secret('AWS_REGION') }}"
+    runIf: >
+      {{ outputs.export_revenue_xlsx.outputFiles['revenue_per_product.xlsx'] is defined }}
+      and {{ outputs.extract_premium.outputFiles['premium_wines.csv'] is defined }}
+      and {{ outputs.extract_ordinary.outputFiles['ordinary_wines.csv'] is defined }}
+    inputFiles:
+      revenue_per_product.xlsx: "{{ outputs.export_revenue_xlsx.outputFiles['revenue_per_product.xlsx'] }}"
+      premium_wines.csv:       "{{ outputs.extract_premium.outputFiles['premium_wines.csv'] }}"
+      ordinary_wines.csv:      "{{ outputs.extract_ordinary.outputFiles['ordinary_wines.csv'] }}"
+    script: |
+      import boto3, os
+
+      s3 = boto3.client("s3", region_name=os.environ["AWS_REGION"])
+      bucket = "my-kestra-bucket"
+      uploads = {
+        "extracts/revenue_per_product.xlsx": "revenue_per_product.xlsx",
+        "extracts/premium_wines.csv":       "premium_wines.csv",
+        "extracts/ordinary_wines.csv":      "ordinary_wines.csv"
+      }
+
+      for key, local in uploads.items():
+        s3.upload_file(local, bucket, key)
+
+  # Error handling block: if any task fails, log to S3 + send alert email
+errors:
+  - id: dead_letter_log
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: kestra-python-deps:latest
+    env:
+     AWS_ACCESS_KEY_ID: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+     AWS_SECRET_ACCESS_KEY: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+     AWS_REGION: "{{ secret('AWS_REGION') }}"
+    script: |
+      import json, boto3, os
+      from datetime import datetime
+
+      execution = {{ execution | json }}
+      s3 = boto3.client("s3", region_name=os.environ["AWS_REGION"])
+      key = f"dead-letter/{execution['id']}/failed-task.json"
+      bucket = "my-kestra-bucket"
+
+      with open("failed.json", "w") as f:
+          json.dump(execution, f, indent=2)
+
+      s3.upload_file("failed.json", bucket, key)
+
+  - id: send_failure_email
+    type: io.kestra.plugin.notifications.sendgrid.SendGridMailSend
+    sendgridApiKey: "{{ secret('SENDGRID_API_KEY') }}"
+    from: "motasemmkamz@gmail.com"
+    to:
+      - "motasemmkamz@gmail.com"
+    subject: "❌ Workflow '{{ flow.id }}' failed"
+    textContent: |
+      ⚠️ A failure occurred in your Kestra flow.
+
+      • Flow ID: {{ flow.id }}
+      • Namespace: {{ flow.namespace }}
+      • Execution ID: {{ execution.id }}
+      • Started: {{ execution.startDate }}
+
+      Please check the Kestra UI for more details.
+
+
+
+  
